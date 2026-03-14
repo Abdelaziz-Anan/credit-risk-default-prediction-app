@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -56,6 +55,330 @@ def find_missing_columns(df: pd.DataFrame, expected: Iterable[str]) -> list[str]
 
 def format_percent(value: float) -> str:
     return f"{value * 100:.1f}%"
+
+
+def _pdf_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _pdf_rgb(color: tuple[float, float, float]) -> str:
+    return f"{color[0]:.3f} {color[1]:.3f} {color[2]:.3f}"
+
+
+def _pdf_text(
+    commands: list[str],
+    x: float,
+    y: float,
+    text: str,
+    font: str = "F1",
+    size: int = 11,
+    color: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    commands.extend(
+        [
+            "BT",
+            f"/{font} {size} Tf",
+            f"{_pdf_rgb(color)} rg",
+            f"1 0 0 1 {x:.1f} {y:.1f} Tm ({_pdf_escape(str(text))}) Tj",
+            "ET",
+        ]
+    )
+
+
+def _pdf_fill_rect(
+    commands: list[str],
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    color: tuple[float, float, float],
+) -> None:
+    commands.extend([f"{_pdf_rgb(color)} rg", f"{x:.1f} {y:.1f} {width:.1f} {height:.1f} re f"])
+
+
+def _pdf_stroke_rect(
+    commands: list[str],
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    color: tuple[float, float, float],
+    line_width: float = 1.0,
+) -> None:
+    commands.extend(
+        [
+            f"{line_width:.2f} w",
+            f"{_pdf_rgb(color)} RG",
+            f"{x:.1f} {y:.1f} {width:.1f} {height:.1f} re S",
+        ]
+    )
+
+
+def _pdf_wrap_text(text: str, max_chars: int = 45) -> list[str]:
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) <= max_chars:
+            current = f"{current} {word}"
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _format_money(value: object) -> str:
+    try:
+        return f"${float(value):,.0f}"
+    except Exception:
+        return str(value)
+
+
+def _format_number(value: object, decimals: int = 2) -> str:
+    try:
+        return f"{float(value):,.{decimals}f}"
+    except Exception:
+        return str(value)
+
+
+def build_scoring_report_pdf(report: dict) -> bytes:
+    inputs = report.get("inputs", {})
+    generated_raw = str(report.get("generated_at_utc", "-"))
+    generated_display = generated_raw
+    report_id = "CR-REPORT"
+    try:
+        parsed_dt = datetime.fromisoformat(generated_raw.replace("Z", "+00:00"))
+        generated_display = parsed_dt.strftime("%d %b %Y %H:%M UTC")
+        report_id = f"CR-{parsed_dt.strftime('%Y%m%d-%H%M%S')}"
+    except Exception:
+        pass
+
+    prediction = str(report.get("prediction", "-"))
+    default_probability = str(report.get("default_probability", "-"))
+    probability_value = float(report.get("default_probability_value", 0.0))
+    probability_value = min(max(probability_value, 0.0), 1.0)
+    risk_band = str(report.get("risk_band", "-"))
+
+    risk_colors = {
+        "High": (0.70, 0.12, 0.12),
+        "Medium": (0.77, 0.47, 0.06),
+        "Low": (0.09, 0.47, 0.21),
+    }
+    risk_color = risk_colors.get(risk_band, (0.22, 0.24, 0.29))
+
+    status_value = int(inputs.get("Status", 0)) if str(inputs.get("Status", "0")).isdigit() else 0
+    previous_status = "Previously Paid" if status_value == 1 else "Previously Not Paid"
+    high_interest = "Yes" if int(inputs.get("High_Interest_Flag", 0)) == 1 else "No"
+    recommendation = {
+        "High": "Recommendation: Manual approval only with strict credit controls.",
+        "Medium": "Recommendation: Route to analyst review before final decision.",
+        "Low": "Recommendation: Proceed with standard underwriting checks.",
+    }.get(risk_band, "Recommendation: Follow standard risk governance process.")
+
+    dark_blue = (0.07, 0.15, 0.30)
+    slate = (0.16, 0.18, 0.22)
+    light_bg = (0.96, 0.97, 0.99)
+    border = (0.85, 0.88, 0.92)
+    white = (1.0, 1.0, 1.0)
+
+    commands: list[str] = []
+
+    _pdf_fill_rect(commands, 0, 0, 595, 842, white)
+
+    _pdf_fill_rect(commands, 0, 758, 595, 84, dark_blue)
+    _pdf_text(commands, 36, 806, "Credit Risk Applicant Scoring Report", font="F2", size=18, color=white)
+    _pdf_text(commands, 36, 786, "Decision Support Summary", font="F1", size=11, color=(0.85, 0.90, 0.98))
+    _pdf_text(commands, 388, 806, f"Report ID: {report_id}", font="F1", size=10, color=white)
+    _pdf_text(commands, 388, 788, f"Generated: {generated_display}", font="F1", size=10, color=(0.85, 0.90, 0.98))
+
+    metric_y = 654
+    metric_w = 167
+    metric_h = 84
+    metric_gap = 14
+    start_x = 36
+    metric_cards = [
+        {
+            "label": "Predicted Outcome",
+            "value": prediction,
+            "background": light_bg,
+            "label_color": (0.32, 0.36, 0.42),
+            "value_color": slate,
+            "note": "",
+        },
+        {
+            "label": "Default Probability",
+            "value": default_probability,
+            "background": light_bg,
+            "label_color": (0.32, 0.36, 0.42),
+            "value_color": slate,
+            "note": "",
+        },
+        {
+            "label": "Risk Band",
+            "value": risk_band.upper(),
+            "background": risk_color,
+            "label_color": white,
+            "value_color": white,
+            "note": f"Band from probability: {default_probability}",
+        },
+    ]
+
+    for idx, card in enumerate(metric_cards):
+        x = start_x + idx * (metric_w + metric_gap)
+        border_color = white if card["label"] == "Risk Band" else border
+        _pdf_fill_rect(commands, x, metric_y, metric_w, metric_h, card["background"])
+        _pdf_stroke_rect(commands, x, metric_y, metric_w, metric_h, border_color, line_width=1.2)
+        _pdf_text(commands, x + 12, metric_y + 58, card["label"], font="F2", size=11, color=card["label_color"])
+        _pdf_text(commands, x + 12, metric_y + 28, card["value"], font="F2", size=18, color=card["value_color"])
+        if card["note"]:
+            _pdf_text(
+                commands,
+                x + 12,
+                metric_y + 12,
+                card["note"],
+                font="F1",
+                size=8,
+                color=(0.92, 0.97, 0.94),
+            )
+
+    _pdf_text(
+        commands,
+        36,
+        642,
+        "Risk Band Rule: Low < 25% | Medium 25% - 49.99% | High >= 50%",
+        font="F2",
+        size=10,
+        color=slate,
+    )
+
+    left_x = 36
+    right_x = 304
+    panel_y = 416
+    panel_w = 255
+    panel_h = 214
+
+    _pdf_fill_rect(commands, left_x, panel_y, panel_w, panel_h, white)
+    _pdf_stroke_rect(commands, left_x, panel_y, panel_w, panel_h, border)
+    _pdf_fill_rect(commands, left_x, panel_y + panel_h - 28, panel_w, 28, light_bg)
+    _pdf_text(commands, left_x + 10, panel_y + panel_h - 18, "Applicant Profile", font="F2", size=11, color=slate)
+
+    left_lines = [
+        f"Age: {_format_number(inputs.get('Age', '-'), 0)} years",
+        f"Annual Income: {_format_money(inputs.get('Income', '-'))}",
+        f"Home Ownership: {inputs.get('Home', '-')}",
+        f"Employment Length: {_format_number(inputs.get('Emp_length', '-'), 0)} years",
+        f"Loan Purpose: {inputs.get('Intent', '-')}",
+    ]
+    y = panel_y + panel_h - 48
+    for line in left_lines:
+        wrapped = _pdf_wrap_text(line, max_chars=34)
+        for w_line in wrapped:
+            _pdf_text(commands, left_x + 12, y, w_line, font="F1", size=10, color=slate)
+            y -= 16
+        y -= 2
+
+    _pdf_fill_rect(commands, right_x, panel_y, panel_w, panel_h, white)
+    _pdf_stroke_rect(commands, right_x, panel_y, panel_w, panel_h, border)
+    _pdf_fill_rect(commands, right_x, panel_y + panel_h - 28, panel_w, 28, light_bg)
+    _pdf_text(commands, right_x + 10, panel_y + panel_h - 18, "Loan and Affordability", font="F2", size=11, color=slate)
+
+    right_lines = [
+        f"Requested Loan Amount: {_format_money(inputs.get('Amount', '-'))}",
+        f"Interest Rate: {_format_number(inputs.get('Rate', '-'), 2)}%",
+        f"Loan to Income: {_format_number(float(inputs.get('Percent_income', 0.0)) * 100, 2)}%",
+        f"High Interest Segment: {high_interest}",
+        f"Previous Loan Status: {previous_status}",
+    ]
+    y = panel_y + panel_h - 48
+    for line in right_lines:
+        wrapped = _pdf_wrap_text(line, max_chars=35)
+        for w_line in wrapped:
+            _pdf_text(commands, right_x + 12, y, w_line, font="F1", size=10, color=slate)
+            y -= 16
+        y -= 2
+
+    gauge_x, gauge_y, gauge_w, gauge_h = 36, 274, 523, 122
+    _pdf_fill_rect(commands, gauge_x, gauge_y, gauge_w, gauge_h, white)
+    _pdf_stroke_rect(commands, gauge_x, gauge_y, gauge_w, gauge_h, border)
+    _pdf_fill_rect(commands, gauge_x, gauge_y + gauge_h - 28, gauge_w, 28, light_bg)
+    _pdf_text(commands, gauge_x + 10, gauge_y + gauge_h - 18, "Risk Probability Indicator", font="F2", size=11, color=slate)
+    _pdf_text(
+        commands,
+        gauge_x + 12,
+        gauge_y + 72,
+        f"Default Probability: {default_probability}",
+        font="F2",
+        size=12,
+        color=slate,
+    )
+
+    bar_x, bar_y, bar_w, bar_h = gauge_x + 12, gauge_y + 40, gauge_w - 24, 16
+    _pdf_fill_rect(commands, bar_x, bar_y, bar_w, bar_h, (0.90, 0.92, 0.95))
+    _pdf_fill_rect(commands, bar_x, bar_y, bar_w * probability_value, bar_h, risk_color)
+    _pdf_stroke_rect(commands, bar_x, bar_y, bar_w, bar_h, border, line_width=0.8)
+    _pdf_text(commands, bar_x, bar_y - 16, "0%", font="F1", size=9, color=(0.40, 0.45, 0.52))
+    _pdf_text(commands, bar_x + bar_w - 18, bar_y - 16, "100%", font="F1", size=9, color=(0.40, 0.45, 0.52))
+
+    rec_lines = _pdf_wrap_text(recommendation, max_chars=80)
+    rec_y = gauge_y + 16
+    for rec_line in rec_lines:
+        _pdf_text(commands, gauge_x + 12, rec_y, rec_line, font="F1", size=10, color=slate)
+        rec_y -= 14
+
+    _pdf_text(
+        commands,
+        36,
+        44,
+        "Confidential - Generated by Credit Risk Analytics Application",
+        font="F1",
+        size=9,
+        color=(0.35, 0.39, 0.45),
+    )
+    _pdf_text(
+        commands,
+        411,
+        44,
+        "Page 1 of 1",
+        font="F1",
+        size=9,
+        color=(0.35, 0.39, 0.45),
+    )
+
+    content_stream = "\n".join(commands).encode("latin-1", errors="replace")
+
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 5 0 R /Resources << /Font << /F1 4 0 R /F2 6 0 R >> >> >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        f"5 0 obj\n<< /Length {len(content_stream)} >>\nstream\n".encode("ascii")
+        + content_stream
+        + b"\nendstream\nendobj\n",
+        b"6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n",
+    ]
+
+    pdf_bytes = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf_bytes))
+        pdf_bytes.extend(obj)
+
+    xref_start = len(pdf_bytes)
+    pdf_bytes.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf_bytes.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf_bytes.extend(f"{offset:010} 00000 n \n".encode("ascii"))
+
+    pdf_bytes.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_start}\n%%EOF"
+        ).encode("ascii")
+    )
+    return bytes(pdf_bytes)
 
 
 def get_categorical_options(model, feature: str, fallback: list[str]) -> list[str]:
@@ -777,24 +1100,32 @@ def render_scoring(df: pd.DataFrame, model) -> None:
     st.progress(min(max(default_probability, 0.0), 1.0))
 
     if default_probability >= 0.50:
+        risk_band = "High"
         st.error("Risk Band: High")
     elif default_probability >= 0.25:
+        risk_band = "Medium"
         st.warning("Risk Band: Medium")
     else:
+        risk_band = "Low"
         st.success("Risk Band: Low")
 
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "inputs": input_payload,
         "prediction": DEFAULT_LABELS.get(prediction, str(prediction)),
-        "default_probability": round(default_probability, 6),
+        "default_probability": f"{default_probability:.2%}",
+        "default_probability_value": round(default_probability, 6),
+        "risk_band": risk_band,
     }
 
+    report_pdf = build_scoring_report_pdf(report)
+    safe_ts = report["generated_at_utc"].replace(":", "").replace("-", "").split(".")[0]
+
     st.download_button(
-        label="Download Scoring Report (JSON)",
-        data=json.dumps(report, indent=2),
-        file_name="scoring_report.json",
-        mime="application/json",
+        label="Download Scoring Report (PDF)",
+        data=report_pdf,
+        file_name=f"credit_scoring_report_{safe_ts}.pdf",
+        mime="application/pdf",
     )
 
     with st.expander("View Model Input Payload"):
